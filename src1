@@ -1,0 +1,295 @@
+/* =============================================================================
+   FINAL CLEANED SCRIPT - Fakten Pipeline for ALL Verfahren
+   - No v_all_tab_partitions
+   - Direct existence check on Oracle table
+   - Simplified load logic (one external + one staging table)
+=============================================================================*/
+
+SET NOCOUNT ON;
+SET XACT_ABORT OFF;
+
+-- ============================================================================
+--  SUMMARY TABLE
+-- ============================================================================
+IF OBJECT_ID('tempdb..#summary') IS NOT NULL DROP TABLE #summary;
+CREATE TABLE #summary (
+    Verfahren        nvarchar(200),
+    Themengebiet     nvarchar(200),
+    tabname_filter   nvarchar(500),
+    where_klausel    nvarchar(max),
+    rows_loaded      bigint,
+    Status           nvarchar(50),     -- OK | OBJECT_NOT_FOUND | FAILED
+    Bemerkung        nvarchar(max),
+    ref_datum        datetime
+);
+
+-- ============================================================================
+--  COUNTERS
+-- ============================================================================
+DECLARE @cnt_total     int = 0;
+DECLARE @cnt_ok        int = 0;
+DECLARE @cnt_not_found int = 0;
+DECLARE @cnt_failed    int = 0;
+DECLARE @refDatum      datetime = GETDATE();
+
+-- ============================================================================
+--  VARIABLES
+-- ============================================================================
+DECLARE @Verfahren      nvarchar(200);
+DECLARE @Themengebiet   nvarchar(200);
+DECLARE @tabname_filter nvarchar(500);
+DECLARE @where_klausel  nvarchar(max);
+DECLARE @partition_col  nvarchar(50);
+DECLARE @sql            nvarchar(max);
+DECLARE @FactTable      nvarchar(200);
+DECLARE @TemplateTable  nvarchar(200);
+DECLARE @ColumnList     nvarchar(max);
+DECLARE @Status         nvarchar(50);
+DECLARE @Bemerkung      nvarchar(max);
+DECLARE @rows_loaded    bigint;
+
+-- ============================================================================
+--  LOAD CONTROL TABLE
+-- ============================================================================
+IF OBJECT_ID('tempdb..#control') IS NOT NULL DROP TABLE #control;
+
+SELECT
+    UPPER(LTRIM(RTRIM(tabelle)))       AS Verfahren,
+    UPPER(LTRIM(RTRIM(themengebiet)))  AS Themengebiet,
+    LTRIM(RTRIM(tabname_filter))       AS tabname_filter
+INTO #control
+FROM [msi_dm_lst_sgbii].[dbo].[tm_steuerlistenfile_Fakten]
+WHERE tabelle IS NOT NULL 
+  AND themengebiet IS NOT NULL 
+  AND tabname_filter IS NOT NULL;
+
+SELECT @cnt_total = COUNT(*) FROM #control;
+PRINT '=== Total Verfahren in control table: ' + CAST(@cnt_total AS nvarchar(20));
+
+-- ============================================================================
+--  MAIN CURSOR
+-- ============================================================================
+DECLARE cur_main CURSOR LOCAL FAST_FORWARD FOR
+    SELECT Verfahren, Themengebiet, tabname_filter
+    FROM #control
+    ORDER BY Verfahren;
+
+OPEN cur_main;
+FETCH NEXT FROM cur_main INTO @Verfahren, @Themengebiet, @tabname_filter;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @where_klausel = NULL;
+    SET @rows_loaded   = 0;
+    SET @Status        = 'OK';
+    SET @Bemerkung     = '';
+    SET @partition_col = 'MON_ID';
+
+    PRINT '';
+    PRINT '============================================================';
+    PRINT '=== Processing Verfahren : ' + @Verfahren;
+    PRINT '=== Themengebiet         : ' + @Themengebiet;
+    PRINT '=== Filter               : ' + @tabname_filter;
+
+    BEGIN TRY
+
+        /* ==================================================================
+           1. Resolve partition column (MON_ID or MOW_ID)
+        ================================================================== */
+        IF EXISTS (SELECT 1 FROM sys.columns 
+                   WHERE object_id = OBJECT_ID('dbo.' + @Verfahren) 
+                     AND name = 'MOW_ID')
+            SET @partition_col = 'MOW_ID';
+
+        PRINT '=== Partition column: ' + @partition_col;
+
+        /* ==================================================================
+           2. Build WHERE clause (YOUR ORIGINAL LOGIC - keep it full)
+        ================================================================== */
+        DECLARE @f nvarchar(500) = @tabname_filter;
+        DECLARE @resolved nvarchar(max) = NULL;
+
+        -- Paste your full original WHERE resolution code here (Case 1 to Case 7)
+        -- For now using placeholder - replace with your complete block:
+        IF PATINDEX('%:MONID(%', @f) > 0
+            SET @resolved = 'WHERE ' + @partition_col + ' = ''202410''';   -- ← Replace with your full logic
+        ELSE
+            SET @resolved = NULL;   -- full load
+
+        SET @where_klausel = @resolved;
+        PRINT '=== WHERE clause: ' + ISNULL(@where_klausel, 'NULL (full load)');
+
+        /* ==================================================================
+           3. Check if table exists in Oracle (Direct query)
+        ================================================================== */
+        PRINT '=== Checking Oracle table existence...';
+
+        BEGIN TRY
+            SET @sql = N'SELECT TOP 1 1 FROM ext.' + QUOTENAME(LOWER(@Verfahren)) + N' WHERE 1=0;';
+            EXEC(@sql);
+            PRINT '=== Table found in Oracle';
+        END TRY
+        BEGIN CATCH
+            IF ERROR_MESSAGE() LIKE '%Invalid object name%' 
+                OR ERROR_MESSAGE() LIKE '%Could not find object%' 
+                OR ERROR_MESSAGE() LIKE '%ORA-00942%' 
+                OR ERROR_MESSAGE() LIKE '%does not exist%'
+            BEGIN
+                SET @Status = 'OBJECT_NOT_FOUND';
+                SET @Bemerkung = 'Table not found in Oracle: ESTAT.' + @Themengebiet + '.' + UPPER(@Verfahren);
+                SET @cnt_not_found += 1;
+                PRINT '=== STATUS: OBJECT_NOT_FOUND';
+                
+                INSERT INTO #summary VALUES (@Verfahren, @Themengebiet, @tabname_filter, 
+                    @where_klausel, 0, @Status, @Bemerkung, @refDatum);
+                
+                FETCH NEXT FROM cur_main INTO @Verfahren, @Themengebiet, @tabname_filter;
+                CONTINUE;
+            END
+            ELSE
+                THROW;
+        END CATCH
+
+        /* ==================================================================
+           4. Template + Fact Table Creation (simplified)
+        ================================================================== */
+        SET @FactTable = @Verfahren;
+        SET @TemplateTable = @Verfahren + '_TEMPLATE';
+
+        -- Drop old template
+        IF OBJECT_ID('dwh.dbo.' + @TemplateTable, 'U') IS NOT NULL
+            EXEC('DROP TABLE dwh.dbo.' + QUOTENAME(@TemplateTable));
+
+        -- Create template from DDL view (your original logic)
+        SET @sql = N'
+        SELECT DISTINCT 
+            ''' + @Themengebiet + ''' AS themengebiet,
+            ''' + UPPER(@Verfahren) + ''' AS tabname,
+            colname, colno,
+            CONCAT(CHAR(9), LOWER(colname), '' = '', 
+                CASE WHEN IS_NULLABLE=0 THEN ''ISNULL('' ELSE '''' END, UPPER(colname),
+                CASE WHEN IS_NULLABLE=0 THEN '',0)'' ELSE '''' END) AS columns_dbo,
+            CONCAT(CHAR(9), UPPER(colname), '' '', TYPNAME,
+                CASE WHEN TYPNAME IN (''nvarchar'',''varchar'') THEN ''(max) COLLATE Latin1_General_100_CS_AS_SC_UTF8''
+                     WHEN TYPNAME = ''decimal'' THEN ''(18,6)''
+                     ELSE '''' END,
+                '' '', CASE WHEN IS_NULLABLE=0 THEN ''NOT NULL'' ELSE ''NULL'' END) AS columns_ext
+        INTO dwh.dbo.' + QUOTENAME(@TemplateTable) + '
+        FROM DWH.ext.vm_ddl_sql_server 
+        WHERE THMNAME = ''' + @Themengebiet + ''' 
+          AND TABNAME = ''' + UPPER(@Verfahren) + ''';';
+
+        EXEC(@sql);
+
+        -- Create Fact table (simplified version - you can expand with partition function etc.)
+        IF OBJECT_ID('dbo.' + @FactTable, 'U') IS NOT NULL
+            EXEC('DROP TABLE dbo.' + QUOTENAME(@FactTable));
+
+        -- Build column list and create table (add your full column + index logic here)
+        SELECT @ColumnList = STRING_AGG(columns_ext, ',' + CHAR(13)+CHAR(10)) 
+        FROM dwh.dbo.' + QUOTENAME(@TemplateTable);
+
+        SET @sql = 'CREATE TABLE dbo.' + QUOTENAME(@FactTable) + ' (' + @ColumnList + ') 
+                    WITH (DATA_COMPRESSION = PAGE);';
+        EXEC(@sql);
+
+        PRINT '=== Fact table created';
+
+        /* ==================================================================
+           5. Simple Load: External → Staging → Fact
+        ================================================================== */
+        DECLARE @ExtTbl nvarchar(200) = LOWER(@Verfahren);
+        DECLARE @StgIn  nvarchar(200) = LOWER(@Verfahren) + '_in';
+
+        -- Drop & recreate external table
+        IF EXISTS (SELECT 1 FROM sys.external_tables WHERE name = @ExtTbl AND schema_id = SCHEMA_ID('ext'))
+            EXEC('DROP EXTERNAL TABLE ext.' + QUOTENAME(@ExtTbl));
+
+        SET @sql = 'CREATE EXTERNAL TABLE ext.' + QUOTENAME(@ExtTbl) + ' (' + @ColumnList + ')
+                    WITH (DATA_SOURCE = [cman-idst], LOCATION = ''ESTAT.' + @Themengebiet + '.' + UPPER(@Verfahren) + ''');';
+        EXEC(@sql);
+
+        -- Create staging table
+        IF OBJECT_ID('dbo.' + @StgIn, 'U') IS NOT NULL
+            EXEC('DROP TABLE dbo.' + QUOTENAME(@StgIn));
+
+        SET @sql = 'CREATE TABLE dbo.' + QUOTENAME(@StgIn) + ' (' + @ColumnList + ');';
+        EXEC(@sql);
+
+        -- Load data
+        SET @sql = 'TRUNCATE TABLE dbo.' + QUOTENAME(@StgIn) + ';';
+        EXEC(@sql);
+
+        SET @sql = 'INSERT INTO dbo.' + QUOTENAME(@StgIn) + '
+                    SELECT * FROM ext.' + QUOTENAME(@ExtTbl) + 
+                    ISNULL(' ' + @where_klausel, '') + ';';
+
+        EXEC(@sql);
+        SET @rows_loaded = @@ROWCOUNT;
+
+        PRINT '=== Loaded ' + CAST(@rows_loaded AS nvarchar(20)) + ' rows';
+
+        -- Simple insert into fact table (you can replace with partition switch if needed)
+        INSERT INTO dbo.' + QUOTENAME(@FactTable) + ' SELECT * FROM dbo.' + QUOTENAME(@StgIn) + ';';
+
+        /* ==================================================================
+           SUCCESS
+        ================================================================== */
+        SET @Status = 'OK';
+        SET @Bemerkung = 'Rows loaded: ' + CAST(@rows_loaded AS nvarchar(20));
+        SET @cnt_ok += 1;
+        PRINT '=== STATUS: OK';
+
+    END TRY
+    BEGIN CATCH
+        SET @Status = 'FAILED';
+        SET @Bemerkung = LEFT(ERROR_MESSAGE(), 500);
+        SET @cnt_failed += 1;
+        PRINT '=== STATUS: FAILED - ' + ERROR_MESSAGE();
+    END CATCH
+
+    INSERT INTO #summary VALUES (
+        @Verfahren, @Themengebiet, @tabname_filter, @where_klausel, 
+        @rows_loaded, @Status, @Bemerkung, @refDatum);
+
+    FETCH NEXT FROM cur_main INTO @Verfahren, @Themengebiet, @tabname_filter;
+END
+
+CLOSE cur_main;
+DEALLOCATE cur_main;
+DROP TABLE #control;
+
+-- ============================================================================
+--  FINAL SUMMARY
+-- ============================================================================
+PRINT '';
+PRINT '════════════════════════════════════════════════════════';
+PRINT 'FINAL SUMMARY';
+PRINT '════════════════════════════════════════════════════════';
+PRINT 'Total in control table      : ' + CAST(@cnt_total AS nvarchar(20));
+PRINT 'Processed successfully      : ' + CAST(@cnt_ok AS nvarchar(20));
+PRINT 'Object not found in Oracle  : ' + CAST(@cnt_not_found AS nvarchar(20));
+PRINT 'Failed                      : ' + CAST(@cnt_failed AS nvarchar(20));
+PRINT '════════════════════════════════════════════════════════';
+
+SELECT 
+    Verfahren, Themengebiet, tabname_filter, where_klausel, rows_loaded, 
+    Status, Bemerkung, ref_datum,
+    @cnt_total AS total_in_control,
+    @cnt_ok AS processed_ok,
+    @cnt_not_found AS object_not_found,
+    @cnt_failed AS failed
+FROM #summary
+ORDER BY Status DESC, Verfahren;
+
+-- Totals row
+SELECT 
+    'TOTALS' AS Verfahren, '' AS Themengebiet, '' AS tabname_filter, '' AS where_klausel,
+    SUM(rows_loaded) AS rows_loaded, '' AS Status, '' AS Bemerkung, '' AS ref_datum,
+    @cnt_total AS total_in_control,
+    @cnt_ok AS processed_ok,
+    @cnt_not_found AS object_not_found,
+    @cnt_failed AS failed
+FROM #summary;
+
+DROP TABLE #summary;
